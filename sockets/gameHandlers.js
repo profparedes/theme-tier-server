@@ -266,6 +266,95 @@ export function gameHandlers(io, socket) {
     }
   })
 
+  // Remove player handler
+  socket.on('remove_player', ({ roomId, playerName }) => {
+    try {
+      if (!roomId || !playerName) return
+      
+      const room = getRoomData(roomId)
+      if (!room) return
+      
+      // Verificar se quem está removendo é o master
+      if (room.master !== socket.id) {
+        socket.emit('error', { message: 'Only the master can remove players' })
+        return
+      }
+      
+      // Encontrar o jogador a ser removido
+      const playerToRemove = Array.from(room.players.values()).find(p => p.name === playerName)
+      if (!playerToRemove) {
+        socket.emit('error', { message: 'Player not found' })
+        return
+      }
+      
+      // Não permitir que o master se remova
+      if (playerToRemove.isMaster) {
+        socket.emit('error', { message: 'Master cannot remove themselves' })
+        return
+      }
+      
+      // Remover jogador da sala
+      room.players.delete(playerToRemove.id)
+      room.cards.delete(playerToRemove.id)
+      
+      // Notificar todos os jogadores sobre a remoção
+      io.to(roomId).emit('update_players', {
+        players: getPlayersArray(room),
+      })
+      
+      // Notificar o jogador removido
+      io.to(playerToRemove.id).emit('player_removed', {
+        message: 'You have been removed from the room by the master'
+      })
+      
+      // Se o jogo já começou, redistribuir cartas
+      if (room.gameStarted && room.players.size > 0) {
+        room.cards.clear()
+        const playerCount = room.players.size
+        const numbers = generateUniqueNumbers(playerCount)
+        
+        if (numbers.length === playerCount) {
+          let index = 0
+          room.players.forEach((player, socketId) => {
+            const card = numbers[index]
+            room.cards.set(socketId, card)
+            
+            io.to(socketId).emit('card_distributed', { card })
+            index++
+          })
+          
+          console.log(`🎴 Cards redistributed in room ${roomId} after player removal`)
+        }
+      }
+      
+      console.log(`🗑️  Player ${playerName} removed from room ${roomId} by master`)
+    } catch (error) {
+      console.error('Error removing player:', error)
+      socket.emit('error', { message: 'Failed to remove player' })
+    }
+  })
+
+  // Request card redistribution handler
+  socket.on('request_card_redistribution', ({ roomId }) => {
+    try {
+      if (!roomId) return
+      
+      const room = getRoomData(roomId)
+      if (!room) return
+      
+      if (room.gameStarted && room.cards.has(socket.id)) {
+        // Enviar carta atual do jogador
+        socket.emit('card_distributed', {
+          card: room.cards.get(socket.id),
+        })
+        
+        console.log(`🎴 Card redistributed to ${socket.data.playerName} in room ${roomId}`)
+      }
+    } catch (error) {
+      console.error('Error handling card redistribution request:', error)
+    }
+  })
+
   // Keep alive handler
   socket.on('keep_alive', ({ roomId }) => {
     try {
@@ -329,10 +418,37 @@ export function gameHandlers(io, socket) {
         })
         
         // Se o jogo já começou, enviar carta
-        if (room.gameStarted && room.cards.has(socket.id)) {
-          socket.emit('card_distributed', {
-            card: room.cards.get(socket.id),
-          })
+        if (room.gameStarted) {
+          // Procurar carta do jogador pelo nome (já que o socket.id mudou)
+          let playerCard = null
+          
+          // Primeiro, tentar encontrar pelo socket antigo
+          const oldSocketId = existingPlayer.oldSocketId
+          if (oldSocketId && room.cards.has(oldSocketId)) {
+            playerCard = [oldSocketId, room.cards.get(oldSocketId)]
+          } else {
+            // Se não encontrar, procurar por nome
+            playerCard = Array.from(room.cards.entries()).find(([socketId, card]) => {
+              const player = room.players.get(socketId)
+              return player && player.name === playerName
+            })
+          }
+          
+          if (playerCard) {
+            // Atualizar o mapeamento da carta para o novo socket.id
+            room.cards.delete(playerCard[0])
+            room.cards.set(socket.id, playerCard[1])
+            
+            socket.emit('card_distributed', {
+              card: playerCard[1],
+            })
+            
+            console.log(`🎴 Card ${playerCard[1]} sent to reconnected player ${playerName}`)
+          } else {
+            console.log(`⚠️  No card found for reconnected player ${playerName}`)
+            console.log(`📊 Available cards:`, Array.from(room.cards.entries()))
+            console.log(`👥 Available players:`, Array.from(room.players.values()).map(p => ({ name: p.name, id: p.id, oldSocketId: p.oldSocketId })))
+          }
         }
         
         console.log(`🔄 ${playerName} reconnected to room ${roomId}`)
@@ -358,6 +474,7 @@ export function gameHandlers(io, socket) {
         const player = room.players.get(socket.id)
         player.disconnected = true
         player.disconnectedAt = Date.now()
+        player.oldSocketId = socket.id // Manter referência do socket antigo
         room.players.set(socket.id, player)
         
         console.log(`⚠️  ${playerName} disconnected from room ${roomId} (temporary)`)
